@@ -1,5 +1,6 @@
 #include <switch.h>
 #include <string.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -16,6 +17,8 @@ u64  g_nroAddr = 0;
 static u64  g_nroSize = 0;
 static NroHeader g_nroHeader;
 static bool g_isApplication = 0;
+static u64 g_curTid = 0;
+static bool g_exitAppOnReturn = false;
 
 static bool g_isAutomaticGameplayRecording = 0;
 static enum {
@@ -218,8 +221,7 @@ static void getIsAutomaticGameplayRecording(void)
         return;
 
     // Retrieve our process' Program ID
-    u64 cur_progid=0;
-    rc = svcGetInfo(&cur_progid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
+    rc = svcGetInfo(&g_curTid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
     if (R_FAILED(rc)) diagAbortWithResult(rc); // shouldn't happen
 
     // Try reading our NACP
@@ -227,11 +229,32 @@ static void getIsAutomaticGameplayRecording(void)
     if (R_SUCCEEDED(rc)) {
         NsApplicationControlData data; // note: this is 144KB, which still fits comfortably within the 1MB of stack we have
         u64 size=0;
-        rc = nsGetApplicationControlData(NsApplicationControlSource_Storage, cur_progid, &data, sizeof(data), &size);
+        rc = nsGetApplicationControlData(NsApplicationControlSource_Storage, g_curTid, &data, sizeof(data), &size);
         nsExit();
 
         if (R_SUCCEEDED(rc) && data.nacp.video_capture == 2)
             g_isAutomaticGameplayRecording = 1;
+    }
+}
+
+static void getApplicationOverrideNroPath(void) {
+    if (g_isApplication && g_curTid) {
+        Result rc = setsysInitialize();
+        if (R_SUCCEEDED(rc)) {
+            char tid_buffer[0x11];
+            u64 path_size = 0;
+            sprintf(tid_buffer, "%016lx", g_curTid);
+
+            const char *const override_name = "hbl_override_path";
+            rc = setsysGetSettingsItemValue(override_name, tid_buffer, g_nextNroPath, sizeof(g_nextNroPath), &path_size);
+            if (R_FAILED(rc) || path_size == 0) {
+                g_nextNroPath[0] = '\0';
+            } else {
+                strcpy(g_nextArgv, g_nextNroPath);
+                g_exitAppOnReturn = true;
+            }
+            setsysExit();
+        }
     }
 }
 
@@ -308,6 +331,64 @@ static void getCodeMemoryCapability(void)
     }
 }
 
+static void selfExit(void) {
+    Service applet, proxy, self;
+    Result rc=0;
+
+    rc = smInitialize();
+    if (R_FAILED(rc))
+        goto fail0;
+
+    rc = smGetService(&applet, g_isApplication ? "appletOE" : "appletAE");
+    if (R_FAILED(rc))
+        goto fail1;
+
+    u32 cmd_id = g_isApplication ? 0 : 200;
+    u64 reserved = 0;
+
+    // GetSessionProxy
+    rc = serviceDispatchIn(&applet, cmd_id, reserved,
+        .in_send_pid = true,
+        .in_num_handles = 1,
+        .in_handles = { g_procHandle },
+        .out_num_objects = 1,
+        .out_objects = &proxy,
+    );
+    if (R_FAILED(rc))
+        goto fail2;
+
+    // GetSelfController
+    rc = serviceDispatch(&proxy, 1,
+        .out_num_objects = 1,
+        .out_objects = &self,
+    );
+    if (R_FAILED(rc))
+        goto fail3;
+
+    // Exit
+    rc = serviceDispatch(&self, 0);
+
+    serviceClose(&self);
+
+fail3:
+    serviceClose(&proxy);
+
+fail2:
+    serviceClose(&applet);
+
+fail1:
+    smExit();
+
+fail0:
+    if (R_SUCCEEDED(rc)) {
+        while(1) svcSleepThread(86400000000000ULL);
+        svcExitProcess();
+        __builtin_unreachable();
+    } else {
+        diagAbortWithResult(rc);
+    }
+}
+
 void loadNro(void)
 {
     NroHeader* header = NULL;
@@ -353,6 +434,9 @@ void loadNro(void)
 
     if (g_nextNroPath[0] == '\0')
     {
+        if (g_exitAppOnReturn)
+            selfExit();
+
         memcpy(g_nextNroPath, DEFAULT_NRO, sizeof(DEFAULT_NRO));
         memcpy(g_nextArgv,    DEFAULT_NRO, sizeof(DEFAULT_NRO));
     }
@@ -520,6 +604,7 @@ int main(int argc, char **argv)
 
     getIsApplication();
     getIsAutomaticGameplayRecording();
+    getApplicationOverrideNroPath();
     smExit(); // Close SM as we don't need it anymore.
     setupHbHeap();
     getOwnProcessHandle();
